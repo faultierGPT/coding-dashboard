@@ -65,6 +65,11 @@ class Task(Base):
     # Session mode: full chat history as JSON list of {role, content, timestamp}.
     # Updated live after each user turn; final state becomes Task.output on end.
     chat_history: Mapped[str] = mapped_column(Text, default="")
+    # Session mode: root task id of this session's "lineage".  A session and all
+    # the sessions resumed from it share one root, so every resume reuses the
+    # SAME worktree directory (``data_dir/worktrees/<session_root>``) — which is
+    # what the agent CLIs key their stored conversations by, so resume works.
+    session_root: Mapped[str] = mapped_column(String(32), default="")
 
     # queued | running | success | failed | error | interrupted | cancelled
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
@@ -74,6 +79,9 @@ class Task(Base):
     error: Mapped[str] = mapped_column(Text, default="")
 
     branch: Mapped[str] = mapped_column(String(128), default="")
+    # Result of merging this task's branch back into the default branch:
+    # "" (n/a) | "merged" (landed on default) | "conflict" (branch kept for manual merge).
+    merge_state: Mapped[str] = mapped_column(String(32), default="")
     commit_hash: Mapped[str] = mapped_column(String(64), default="")
     commit_message: Mapped[str] = mapped_column(Text, default="")
     commit_created: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -39,6 +39,16 @@ FAKE_SCRIPT = (
     "pathlib.Path('agent_out.txt').write_text('result', encoding='utf-8')"
 )
 
+# A fake *session* agent: it records its working directory + argv to a shared
+# file (so a test can assert which directory a resumed session ran in) and exits
+# immediately, which the SessionManager treats as the session ending.
+SESSION_RECORD = TMP / "session-cwd-record.tsv"
+FAKE_SESSION_SCRIPT = (
+    "import os,sys,pathlib;"
+    f"pathlib.Path(r'{SESSION_RECORD}').open('a',encoding='utf-8')"
+    ".write(os.getcwd()+chr(9)+' '.join(sys.argv[1:])+chr(10))"
+)
+
 import yaml  # noqa: E402
 
 CONFIG.write_text(
@@ -51,7 +61,16 @@ CONFIG.write_text(
                     "command": [PY, "-c", FAKE_SCRIPT],
                     "prompt_via": "arg",
                     "stream_format": "raw",
-                }
+                },
+                "fakesession": {
+                    "display_name": "Fake Session Agent",
+                    "command": [PY, "-c", FAKE_SCRIPT],
+                    "session_command": [PY, "-c", FAKE_SESSION_SCRIPT],
+                    "session_resume_flags": ["--resume", "-c"],
+                    "session_resume_default": ["--continue-fake"],
+                    "prompt_via": "arg",
+                    "stream_format": "raw",
+                },
             },
         }
     ),
@@ -111,6 +130,51 @@ def test_parser() -> None:
     check("parser captures summary", p.summary() == "Fertig.", p.summary())
     check("parser not error", p.is_error is False)
     check("parser passes through non-json", "not-json-line" in out, out)
+
+
+def test_codex_parser() -> None:
+    from app.agents import _CodexParser
+
+    transcript = (
+        "[2026-06-13T20:00:00] OpenAI Codex v0.139.0 (research preview)\n"
+        "--------\n"
+        "workdir: /proj\n"
+        "model: gpt-5.5\n"
+        "provider: openai\n"
+        "approval: never\n"
+        "sandbox: workspace-write\n"
+        "reasoning effort: medium\n"
+        "--------\n"
+        "[2026-06-13T20:00:01] User instructions:\n"
+        "Bitte erledige die Aufgabe.\n"
+        "GEHEIMER LANGER KONTEXT der nicht in der Konsole landen soll.\n"
+        "\n"
+        "[2026-06-13T20:00:05] thinking\n"
+        "Ich schaue mir die Dateien an.\n"
+        "[2026-06-13T20:00:06] exec bash -lc 'ls -la' in /proj\n"
+        "[2026-06-13T20:00:07] bash -lc 'ls -la' succeeded in 12ms:\n"
+        "total 0\n"
+        "[2026-06-13T20:00:20] codex\n"
+        "Fertig: Die Aufgabe wurde erledigt.\n"
+        "model selection wurde angepasst.\n"  # answer line starting with a banner keyword
+        "[2026-06-13T20:00:21] tokens used: 4321\n"
+    )
+    p = _CodexParser()
+    out = "".join(p.feed(line + "\n") for line in transcript.splitlines())
+    check("codex strips timestamps", "[2026-06-13T20:00" not in out, out)
+    check("codex drops version banner", "OpenAI Codex" not in out, out)
+    check("codex drops metadata banner", "workdir:" not in out and "sandbox:" not in out, out)
+    check("codex drops echoed prompt", "GEHEIMER LANGER KONTEXT" not in out, out)
+    check("codex drops token footer", "tokens used" not in out, out)
+    check("codex keeps thinking text", "schaue mir die Dateien" in out, out)
+    check("codex formats exec as shell", "$ ls -la" in out, out)
+    check("codex keeps final answer", "Die Aufgabe wurde erledigt" in out, out)
+    check("codex drops bare codex marker", "\ncodex\n" not in out, out)
+    check(
+        "codex keeps answer line starting with banner keyword",
+        "model selection wurde angepasst" in out,
+        out,
+    )
 
 
 def test_command_building() -> None:
@@ -364,6 +428,76 @@ def test_config_backfill() -> None:
     check("backfill: custom-only config stays explicit", set(custom.agents) == {"fake"}, str(sorted(custom.agents)))
 
 
+def test_worktree_merge() -> None:
+    """Isolated-worktree merge flow: a task branch merges back into the default
+    branch and pushes; two concurrent branches both land; a conflicting branch
+    is kept (merge_state='conflict') instead of corrupting the default branch."""
+    from app.task_runner import _merge_worktree_branch
+
+    remote = TMP / "wt-remote.git"
+    proj = TMP / "wt-proj"
+    run(["git", "init", "--bare", str(remote)])
+    git_ops.clone(str(remote), proj, token="")
+    git_ops.ensure_identity(proj, "Tester", "t@example.com")
+    (proj / "base.txt").write_text("base\n", encoding="utf-8")
+    git_ops.commit_all(proj, "init", "Tester", "t@example.com")
+    git_ops.push(proj, "main", token="")
+
+    # One clean branch via a worktree -> merges and pushes.
+    wt1 = TMP / "wt1"
+    git_ops.add_worktree(proj, wt1, "cd/task/aaa", "HEAD")
+    (wt1 / "feature_a.txt").write_text("A\n", encoding="utf-8")
+    git_ops.ensure_identity(wt1, "Tester", "t@example.com")
+    res1 = _merge_worktree_branch(
+        str(proj), str(wt1), "cd/task/aaa", "main", "",
+        "Tester", "t@example.com", "feature A", "feature A",
+    )
+    check("worktree branch merged", res1["merge_state"] == "merged", str(res1["messages"]))
+    check("worktree merge pushed", res1["pushed"] is True, str(res1["messages"]))
+    check("worktree dir removed after merge", not wt1.exists(), str(wt1))
+    files = run(["git", "--git-dir", str(remote), "ls-tree", "--name-only", "main"])
+    check("merged feature on remote", "feature_a.txt" in files, files)
+
+    # A second clean branch off the (now-advanced) checkout also lands.
+    wt2 = TMP / "wt2"
+    git_ops.add_worktree(proj, wt2, "cd/task/bbb", "HEAD")
+    (wt2 / "feature_b.txt").write_text("B\n", encoding="utf-8")
+    git_ops.ensure_identity(wt2, "Tester", "t@example.com")
+    res2 = _merge_worktree_branch(
+        str(proj), str(wt2), "cd/task/bbb", "main", "",
+        "Tester", "t@example.com", "feature B", "feature B",
+    )
+    check("second worktree merged", res2["merge_state"] == "merged", str(res2["messages"]))
+    files2 = run(["git", "--git-dir", str(remote), "ls-tree", "--name-only", "main"])
+    check("both features on remote", "feature_a.txt" in files2 and "feature_b.txt" in files2, files2)
+
+    # A conflicting branch: edit base.txt in a worktree AND on the default branch
+    # so the merge cannot apply -> kept as conflict, default branch untouched.
+    wt3 = TMP / "wt3"
+    git_ops.add_worktree(proj, wt3, "cd/task/ccc", "HEAD")
+    (wt3 / "base.txt").write_text("worktree change\n", encoding="utf-8")
+    git_ops.ensure_identity(wt3, "Tester", "t@example.com")
+    git_ops.commit_all(wt3, "wt edit", "Tester", "t@example.com")
+    (proj / "base.txt").write_text("main change\n", encoding="utf-8")
+    git_ops.commit_all(proj, "main edit", "Tester", "t@example.com")
+    head_before = git_ops.head_commit(proj)
+    res3 = _merge_worktree_branch(
+        str(proj), str(wt3), "cd/task/ccc", "main", "",
+        "Tester", "t@example.com", "conflicting", "conflicting",
+    )
+    check("conflict detected", res3["merge_state"] == "conflict", str(res3["messages"]))
+    check(
+        "default branch untouched on conflict",
+        git_ops.head_commit(proj) == head_before,
+        f"{git_ops.head_commit(proj)} vs {head_before}",
+    )
+    check(
+        "default branch has no conflict markers",
+        "<<<<<<<" not in (proj / "base.txt").read_text(encoding="utf-8"),
+        (proj / "base.txt").read_text(encoding="utf-8"),
+    )
+
+
 def test_git_cycle() -> None:
     remote = TMP / "remote.git"
     work = TMP / "work"
@@ -596,6 +730,39 @@ def test_api_and_task() -> None:
         hist = client.get(f"/api/projects/{pid}/tasks", headers=H).json()
         check("history lists task", any(t["id"] == tid for t in hist), str(len(hist)))
 
+        # File browser: list root, traversal blocked, read a text file.
+        listing = client.get(f"/api/projects/{pid}/files", headers=H)
+        check("file listing ok", listing.status_code == 200, str(listing.status_code))
+        names = [e["name"] for e in listing.json().get("entries", [])]
+        check("file listing has README", "README.md" in names, str(names))
+        check("file listing hides .git", ".git" not in names, str(names))
+        traversal = client.get(
+            f"/api/projects/{pid}/files", headers=H, params={"path": "../.."}
+        )
+        check("file traversal blocked -> 400", traversal.status_code == 400, str(traversal.status_code))
+        readf = client.get(
+            f"/api/projects/{pid}/file", headers=H, params={"path": "README.md"}
+        )
+        check("file read ok", readf.status_code == 200, str(readf.status_code))
+        check(
+            "file read returns content",
+            readf.json().get("content", "").startswith("# proj") and not readf.json().get("is_binary"),
+            str(readf.json())[:200],
+        )
+        missing = client.get(
+            f"/api/projects/{pid}/file", headers=H, params={"path": "nope.txt"}
+        )
+        check("file read missing -> 404", missing.status_code == 404, str(missing.status_code))
+
+        # Running dashboard: completed tasks must not appear as running.
+        running = client.get("/api/running", headers=H)
+        check("running endpoint ok", running.status_code == 200, str(running.status_code))
+        check(
+            "finished task not in running",
+            all(r["id"] != tid for r in running.json()),
+            str(running.json()),
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Session mode
@@ -689,20 +856,129 @@ def test_session_end_flow() -> None:
         check("task terminal output preserved", "hello from terminal" in (t.output or ""), t.output or "")
 
 
+def test_session_resume() -> None:
+    """Resuming a session must run in the ORIGINAL session's worktree directory.
+
+    The agent CLIs key their stored conversations by working directory, so a
+    resumed session that landed in a fresh per-task worktree (the bug) could not
+    find the prior conversation.  This drives the real SessionManager with a fake
+    session agent that records its cwd, and asserts that:
+
+      * a fresh session runs in ``worktrees/<its-own-id>`` (parallel-safe),
+      * a resume (explicit ``resume_of``) reuses that exact directory and gets
+        the agent's "continue last" args injected,
+      * a resume requested via a start parameter (``--resume ...``) also reuses
+        the lineage directory and keeps the user's own args.
+    """
+    from app.database import init_db, session_scope
+    from app.models import Task, Project
+    from app.task_runner import session_manager, _worktrees_root
+    import asyncio
+
+    init_db()
+    with session_scope() as db:
+        proj = db.query(Project).filter(Project.slug == "resume-proj").first()
+        if proj is None:
+            remote = TMP / "resume-remote.git"
+            work = TMP / "resume-work"
+            run(["git", "init", "--bare", str(remote)])
+            git_ops.clone(str(remote), work, token="")
+            git_ops.ensure_identity(work, "Tester", "t@example.com")
+            (work / "README.md").write_text("# resume\n", encoding="utf-8")
+            git_ops.commit_all(work, "init", "Tester", "t@example.com")
+            git_ops.push(work, "main", token="")
+            proj = Project(
+                name="ResumeProj", slug="resume-proj", local_path=str(work),
+                default_branch="main", clone_url=str(remote),
+            )
+            db.add(proj)
+            db.commit()
+            db.refresh(proj)
+        pid = proj.id
+
+    def new_session_task() -> str:
+        t = Task(project_id=pid, agent="fakesession", prompt="", mode="session",
+                 is_session=True, status="queued", chat_history="[]")
+        with session_scope() as db:
+            db.add(t)
+            db.commit()
+            db.refresh(t)
+            return t.id
+
+    async def run_session(task_id: str, *, resume_of: str = "", start_args: str = "") -> None:
+        before = SESSION_RECORD.read_text(encoding="utf-8").count("\n") if SESSION_RECORD.exists() else 0
+        await session_manager.start(
+            task_id, pid, "fakesession", "", "", start_args=start_args, resume_of=resume_of
+        )
+        # Wait for the fake agent to record its cwd (it exits immediately).
+        for _ in range(100):
+            cur = SESSION_RECORD.read_text(encoding="utf-8").count("\n") if SESSION_RECORD.exists() else 0
+            if cur > before:
+                break
+            await asyncio.sleep(0.05)
+        # Ensure the session is fully torn down (worktree merged back + removed)
+        # before the next one reuses the directory.  The _ending guard dedupes
+        # with the pump task's own end_session call.
+        await session_manager.end_session(task_id, pid)
+        for _ in range(100):
+            if not session_manager.is_running(task_id):
+                break
+            await asyncio.sleep(0.05)
+
+    def last_record() -> tuple[str, str]:
+        lines = [ln for ln in SESSION_RECORD.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        cwd, _, argv = lines[-1].partition("\t")
+        return cwd, argv
+
+    def session_root_of(task_id: str) -> str:
+        with session_scope() as db:
+            t = db.get(Task, task_id)
+            return t.session_root if t else ""
+
+    wt_root = str(_worktrees_root())
+
+    # 1) Fresh session -> isolated worktree named after its own id.
+    t1 = new_session_task()
+    asyncio.run(run_session(t1))
+    cwd1, _argv1 = last_record()
+    check("fresh session ran in worktrees/<own-id>",
+          cwd1 == os.path.join(wt_root, t1), f"{cwd1} != {os.path.join(wt_root, t1)}")
+    check("fresh session_root = own id", session_root_of(t1) == t1, session_root_of(t1))
+
+    # 2) Resume via explicit resume_of -> SAME directory + auto "continue" args.
+    t2 = new_session_task()
+    asyncio.run(run_session(t2, resume_of=t1))
+    cwd2, argv2 = last_record()
+    check("resume (resume_of) reuses original worktree dir", cwd2 == cwd1, f"{cwd2} != {cwd1}")
+    check("resume keeps lineage root", session_root_of(t2) == t1, session_root_of(t2))
+    check("resume injects agent continue args", "--continue-fake" in argv2, argv2)
+
+    # 3) Resume via a start parameter -> reuses lineage dir, keeps user's args.
+    t3 = new_session_task()
+    asyncio.run(run_session(t3, start_args="--resume deadbeef"))
+    cwd3, argv3 = last_record()
+    check("resume (start param) reuses lineage worktree dir", cwd3 == cwd1, f"{cwd3} != {cwd1}")
+    check("resume (start param) keeps user args", "--resume deadbeef" in argv3, argv3)
+    check("resume (start param) does NOT add auto args", "--continue-fake" not in argv3, argv3)
+
+
 def main() -> int:
     try:
         test_security()
         test_parser()
+        test_codex_parser()
         test_command_building()
         test_final_output()
         test_agent_runner()
         test_goal_mode()
         test_images()
         test_config_backfill()
+        test_worktree_merge()
         test_git_cycle()
         test_api_and_task()
         test_session_api_and_manager()
         test_session_end_flow()
+        test_session_resume()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
 

@@ -60,6 +60,14 @@ async def create_session(
     except ValueError as exc:
         raise HTTPException(400, f"Startparameter können nicht geparst werden: {exc}")
 
+    resume_of = (body.resume_of or "").strip()
+    if resume_of:
+        prior = db.get(Task, resume_of)
+        if prior is None or not prior.is_session or prior.project_id != body.project_id:
+            raise HTTPException(404, "Fortzusetzende Session nicht gefunden.")
+        if prior.status in {"queued", "running"}:
+            raise HTTPException(409, "Diese Session läuft noch und kann nicht fortgesetzt werden.")
+
     task = Task(
         project_id=body.project_id,
         agent=body.agent,
@@ -83,6 +91,7 @@ async def create_session(
             body.model,
             body.effort,
             start_args=start_args,
+            resume_of=resume_of,
         )
     except ValueError as exc:
         with session_scope() as sdb:

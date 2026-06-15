@@ -90,12 +90,14 @@ class TaskOut(BaseModel):
     # Filenames of the attached images (DB stores them as a JSON string).
     images: list[str] = []
     is_session: bool = False
+    session_root: str = ""
     chat_history: list[SessionMessage] = []
     status: str
     exit_code: Optional[int]
     result_summary: str
     error: str
     branch: str
+    merge_state: str = ""
     commit_hash: str
     commit_message: str
     commit_created: bool
@@ -123,6 +125,38 @@ class TaskDetail(TaskOut):
     output: str
 
 
+class RunningTaskOut(TaskOut):
+    """A running/queued task enriched with its project's name/slug for the
+    cross-project dashboard on the start page."""
+
+    project_name: str = ""
+    project_slug: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# File browser
+# --------------------------------------------------------------------------- #
+
+class FileEntry(BaseModel):
+    name: str
+    path: str  # POSIX path relative to the project root
+    is_dir: bool
+    size: int = 0
+
+
+class DirListing(BaseModel):
+    path: str  # the listed directory, relative to the project root ("" = root)
+    entries: list[FileEntry]
+
+
+class FileContent(BaseModel):
+    path: str
+    size: int
+    is_binary: bool
+    truncated: bool = False
+    content: str = ""
+
+
 # --------------------------------------------------------------------------- #
 # Session mode
 # --------------------------------------------------------------------------- #
@@ -145,6 +179,11 @@ class SessionCreate(BaseModel):
     # Shell-like argv string. It is parsed with shlex.split and appended to the
     # configured session_command; no shell is invoked.
     start_args: str = Field(default="", max_length=1000)
+    # Resume a previous session: the task id of an ended session to continue.
+    # The new session runs in that session's worktree directory so the agent
+    # finds its prior, cwd-keyed conversation.  When set and ``start_args`` carry
+    # no explicit resume flag, the agent's "continue last" command is injected.
+    resume_of: str = ""
 
 
 class SessionStartResponse(BaseModel):

@@ -5,44 +5,6 @@ Kurz halten, aktuell halten.
 
 ## Letzter Durchlauf
 
-### 2026-06-15 — claude (Session-Resume trotz isolierter Worktrees)
-
-**Problem:** Eine beendete Session ließ sich nicht per Startparameter
-(`--resume <id>` / `-c` / codex `resume`) fortsetzen. Grund: jede Session läuft
-in einem eigenen Worktree (`data_dir/worktrees/<task_id>`), der beim Beenden
-gelöscht wird. Die Agenten-CLIs speichern ihre Konversation aber **pro
-Arbeitsverzeichnis** (`~/.claude/projects/<cwd-slug>/…`, codex-Picker filtert nach
-cwd) — eine neue Session in einem neuen Worktree-Pfad findet die alte nicht
-("No conversation found with session ID"). Empirisch verifiziert: gleiches
-Verzeichnis → resume klappt, anderes → Fehler.
-
-**Lösung — Session-Lineage mit stabilem Worktree-Pfad:**
-- Neue Spalte `Task.session_root` (additiv, `database.py`-Backfill): der Wurzel-
-  Task einer Session-Kette. Frische Session: `session_root = eigene id`. Resume:
-  erbt den `session_root` des Originals → **derselbe** Worktree-Pfad
-  (`worktrees/<session_root>`) → identischer cwd → Agent findet seine Session.
-  Resume bekommt einen **frischen** Branch `cd/session/<neue-id8>`, merged also
-  weiterhin sauber zurück.
-- `SessionManager._resolve_resume()` erkennt Resume entweder explizit
-  (`resume_of`, von der UI) oder implizit, wenn der User einen der
-  `session_resume_flags` des Agenten tippt; ohne eigenes Resume-Flag wird das
-  `session_resume_default`-Argv injiziert (claude `--continue`, hermes `-c`,
-  codex `resume --last`). Neue `AgentSpec`-Felder `session_resume_flags` /
-  `session_resume_default` (in `default_agents()` für claude/hermes/codex,
-  greifen per Backfill auch in der `/etc`-config.yaml).
-- `POST /api/sessions` akzeptiert `resume_of` (404/409-Validierung). Frontend:
-  `api.createSession(..., resumeOf)`, „Fortsetzen"-Button im
-  `SessionTerminalModal` (Done-State) + `key`-Remount, Hilfetext am
-  Startparameter-Feld, `Task.session_root` in den Typen.
-
-**Ergebnis:** Resume per Startparameter UND per Button funktioniert; frische
-Sessions bleiben isoliert/parallel. `smoke.py` um `test_session_resume`
-(Fake-PTY-Session: fresh→eigener Worktree, resume→selber Worktree + Auto-Args,
-resume-per-Startparam→selber Worktree + User-Args) erweitert; **alle Smoke-Checks**,
-Frontend-Typecheck + Vite-Build grün; echtes `claude --resume` cwd-Verhalten
-verifiziert. Wirksam nach `update.sh` / `systemctl restart coding-dashboard`.
-Noch NICHT committet/gepusht.
-
 ### 2026-06-14 — claude (6 Features: Codex-Output, Fullscreen, AGENTS.md-Refresh, Filebrowser, Parallel-Branches, Agenten-Dashboard)
 
 **Was getan:** Sechs Features geplant und implementiert.

@@ -1,7 +1,10 @@
 import type {
   Agent,
+  DirListing,
+  FileContent,
   Project,
   ProjectCreatePayload,
+  RunningTask,
   SessionMessage,
   Task,
   TaskImagePayload,
@@ -196,6 +199,21 @@ export const api = {
   pullProject: (id: string) =>
     request<{ ok: boolean; branch: string; output: string }>("POST", `/projects/${id}/pull`),
 
+  // Cross-project dashboard of currently running/queued agents.
+  listRunning: () => request<RunningTask[]>("GET", "/running"),
+
+  // File browser
+  listFiles: (projectId: string, path = "") =>
+    request<DirListing>(
+      "GET",
+      `/projects/${projectId}/files?path=${encodeURIComponent(path)}`,
+    ),
+  readFile: (projectId: string, path: string) =>
+    request<FileContent>(
+      "GET",
+      `/projects/${projectId}/file?path=${encodeURIComponent(path)}`,
+    ),
+
   // Session mode
   createSession: (
     projectId: string,
@@ -203,6 +221,7 @@ export const api = {
     model = "",
     effort = "",
     startArgs = "",
+    resumeOf = "",
   ) =>
     request<{ task_id: string; status: string }>("POST", "/sessions", {
       project_id: projectId,
@@ -210,6 +229,7 @@ export const api = {
       model,
       effort,
       start_args: startArgs,
+      resume_of: resumeOf,
     }),
   getSession: (taskId: string) =>
     request<{

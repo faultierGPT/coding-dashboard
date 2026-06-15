@@ -87,7 +87,7 @@ class AgentSpec(BaseModel):
     display_name: str
     command: list[str]
     prompt_via: Literal["arg", "stdin"] = "arg"
-    stream_format: Literal["claude-json", "raw", "lines"] = "raw"
+    stream_format: Literal["claude-json", "codex", "raw", "lines"] = "raw"
     # If set, this agent supports "goal mode": instead of a one-off task prompt
     # the user states a goal and the agent works until it is reached.  The
     # template wraps the user's goal text before it is sent (``{prompt}`` is the
@@ -97,6 +97,16 @@ class AgentSpec(BaseModel):
     # invoked in a PTY so the agent runs in its interactive TUI. No prompt is
     # injected -- optional user supplied start parameters are appended as argv.
     session_command: Optional[list[str]] = None
+    # Resuming a previous session.  The agent CLIs store their conversations
+    # keyed by the working directory, so a resumed session must run in the SAME
+    # directory the original used (see SessionManager).  ``session_resume_flags``
+    # are the argv tokens that, when the user types them as start parameters,
+    # mark the session as a resume (e.g. claude's ``--resume``/``-c``, codex's
+    # ``resume`` sub-command).  ``session_resume_default`` is the argv appended
+    # for a one-click "continue the previous session" when the user supplies no
+    # resume parameter of their own (e.g. claude ``--continue``).
+    session_resume_flags: list[str] = Field(default_factory=list)
+    session_resume_default: list[str] = Field(default_factory=list)
     # Optional model/effort selection. ``*_choices`` is what the UI offers (an
     # empty list hides the selector); ``*_args`` are the argv tokens injected
     # when the user picked a value ("{model}"/"{effort}" are substituted).  The
@@ -154,6 +164,11 @@ def default_agents() -> dict[str, AgentSpec]:
             stream_format="claude-json",
             goal_command="/goal {prompt}",
             session_command=["claude"],
+            # `claude --resume <id>` / `-r` / `--continue` / `-c` all reopen a
+            # conversation stored under the cwd; `--continue` reopens the most
+            # recent one in that directory (our one-click resume default).
+            session_resume_flags=["-r", "--resume", "-c", "--continue", "--fork-session", "--from-pr"],
+            session_resume_default=["--continue"],
             model_choices=["opus", "sonnet", "haiku", "fable"],
             model_args=["--model", "{model}"],
             effort_choices=["low", "medium", "high", "xhigh", "max"],
@@ -171,6 +186,10 @@ def default_agents() -> dict[str, AgentSpec]:
             env={"HERMES_ACCEPT_HOOKS": "1", "NO_COLOR": "1"},
             unset_env=["PYTHONPATH", "PYTHONHOME"],
             session_command=["hermes", "chat"],
+            # `hermes chat --resume <id>` / `-c [name]` continues a prior chat;
+            # `-c` alone continues the most recent (our one-click resume default).
+            session_resume_flags=["-r", "--resume", "-c", "--continue"],
+            session_resume_default=["-c"],
         ),
         "codex": AgentSpec(
             key="codex",
@@ -195,10 +214,15 @@ def default_agents() -> dict[str, AgentSpec]:
                 "-",
             ],
             prompt_via="stdin",
-            stream_format="raw",
+            stream_format="codex",
             env={"NO_COLOR": "1"},
             unset_env=["PYTHONPATH", "PYTHONHOME"],
             session_command=["codex"],
+            # Codex resumes via the `resume` sub-command (`codex resume <id>` /
+            # `codex resume --last`); its picker filters by cwd, so a resume must
+            # run in the original directory. `resume --last` is our one-click default.
+            session_resume_flags=["resume", "fork", "--last", "--continue"],
+            session_resume_default=["resume", "--last"],
             model_choices=[
                 "gpt-5.4",
                 "gpt-5.5",
